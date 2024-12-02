@@ -24,18 +24,18 @@ class S2V_DQN(nn.Module):
         '''w_scale=0.01, node_dim=2, edge_dim=4'''
         super(S2V_DQN, self).__init__()
         # depth of structure2vector
-        self.T = T # number of graph embedding iterations
-        self.embed_dim = embed_dim # p
-        self.reg_hidden = reg_hidden
-        self.avg = avg
+        self.T = T # 图嵌入迭代次数
+        self.embed_dim = embed_dim # 嵌入空间的维度
+        self.reg_hidden = reg_hidden # 如果大于0表示有隐藏层
+        self.avg = avg # 是否使用平均聚合方式
 
         # input node to latent
         self.w_n2l = torch.nn.Parameter(torch.Tensor(node_dim, embed_dim))
-        torch.nn.init.normal_(self.w_n2l, mean=0, std=w_scale)
+        torch.nn.init.normal_(self.w_n2l, mean=0, std=w_scale) # 使用正态分布初始化权重
 
         # input edge to latent
         self.w_e2l = torch.nn.Parameter(torch.Tensor(edge_dim, embed_dim))
-        torch.nn.init.normal_(self.w_e2l, mean=0, std=w_scale)
+        torch.nn.init.normal_(self.w_e2l, mean=0, std=w_scale) # 使用正态分布初始化权重
 
         # linear node conv
         self.p_node_conv = torch.nn.Parameter(torch.Tensor(embed_dim, embed_dim))
@@ -56,11 +56,12 @@ class S2V_DQN(nn.Module):
             torch.nn.init.normal_(self.h2_weight, mean=0, std=w_scale)
             self.last_w = self.h2_weight
         else:
+            # 如果没有隐藏层，直接将节点嵌入拼接并计算Q值
             self.h1_weight = torch.nn.Parameter(torch.Tensor(2 * embed_dim, 1))
             torch.nn.init.normal_(self.h1_weight, mean=0, std=w_scale)
             self.last_w = self.h1_weight
 
-        # S2V scatter message passing
+        # S2V scatter message passing 根据是否使用平均聚合来选择聚合函数
         self.scatter_aggr = (scatter_mean if self.avg else scatter_add)
         
 
@@ -115,15 +116,15 @@ class S2V_DQN(nn.Module):
         y_potential = self.scatter_aggr(data.x, data.batch, dim=0)
         # can concatenate budget to global representation
         if data.y is not None: # Q func given a
-            # batch_size x embed_size
+            # 获取当前选择的节点的嵌入 (batch_size x embed_size)
             action_embed = data.x[data.y]
 
-            # batch_size x (2 x embed_size)
+            # 拼接当前节点选择嵌入与全局图嵌入 (batch_size x (2 x embed_size))
             embed_s_a = torch.cat((action_embed, y_potential), dim=-1) # ConcatCols
 
             last_output = embed_s_a
             if self.reg_hidden > 0:
-                # batch_size x reg_hidden
+                # 如果有隐藏层，进行前向计算 (batch_size x reg_hidden)
                 hidden = torch.matmul(embed_s_a, self.h1_weight)
                 last_output = F.relu(hidden)
             # batch_size x 1
@@ -146,7 +147,7 @@ class S2V_DQN(nn.Module):
 
 
 class Tripling(nn.Module):
-    ''' the tripling GNN RL model '''
+    ''' tripling GNN强化学习模型 '''
     def __init__(self, embed_dim, sgate_l1_dim, tgate_l1_dim, T, hidden_dims, w_scale):
         '''
         embed_dim=50 -> 2*50+1
@@ -158,9 +159,10 @@ class Tripling(nn.Module):
         self.tgate_l1_dim = tgate_l1_dim
         self.T = T
         self.hidden_dims = hidden_dims.copy() 
-        # also include initial embed dim
+        # 也包括初始的嵌入维度
         self.hidden_dims.insert(0, embed_dim)
         self.trans_weights = nn.ParameterList()
+
         # state GNN
         self.influgate_etas = nn.ParameterList()
         self.state_weights_self = nn.ParameterList()
@@ -339,12 +341,17 @@ class Tripling(nn.Module):
 
 
 def get_init_node_embed(graph, num_epochs, device):
-    ''' use deep walk to generate initial node embedding 
-        according to the graph structure (node connection and edge weight)
+    ''' 使用 DeepWalk 算法生成初始节点嵌入
+        根据图的结构（节点连接关系和边权重）生成嵌入
+        初始随机游走要计算loss
     '''
+    # 初始化 DeepWalk 模型，DeepWalk 是一种基于随机游走的图嵌入方法
+    # 设置嵌入维度为 50，随机游走长度为 3，每个节点的最大跳跃数为 5，跳跃大小为 5
+    # 每个节点的游走次数为 50，负样本数量为 5，重启概率为 0.15，sparse=True 表示使用稀疏矩阵
     model = DeepWalkNeg(graph, embedding_dim=50, walk_length=3, r_hop=5, r_hop_size=5, 
         walks_per_node=50, num_negative_samples=5, restart=0.15, sparse=True).to(device)
 
+    # 加载数据的迭代器，指定批量大小为 32，是否打乱数据为 True，使用 4 个工作线程
     loader = model.loader(batch_size=32, shuffle=True, num_workers=4)
     optimizer = torch.optim.SparseAdam(list(model.parameters()), lr=0.01)
 
@@ -353,15 +360,19 @@ def get_init_node_embed(graph, num_epochs, device):
         total_loss = 0
         for pos_rw, neg_rw in loader:
             optimizer.zero_grad()
+            # 计算正样本和负样本的损失
             loss = model.loss(pos_rw.to(device), neg_rw.to(device))
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+            loss.backward() # 反向传播计算梯度
+            optimizer.step() # 更新模型参数
+            total_loss += loss.item() # 累加损失
+        # 返回每个 epoch 的平均损失
         return total_loss / len(loader)
 
     for epoch in range(num_epochs):
         loss = train()
 
+    # 返回训练好的模型的节点嵌入，detach() 用于将张量从计算图中分离出来，防止梯度计算
+    # .cpu() 将嵌入移动到 CPU 上，clone() 确保返回的张量是独立的副本
     return model().detach().cpu().clone()
 
 
@@ -371,20 +382,23 @@ class DeepWalkNeg(nn.Module):
                  walks_per_node=1, num_negative_samples=1, restart=0.5, sparse=False):
         super().__init__()
 
-        self.graph = graph
+        self.graph = graph # 输入的图，通常是一个图数据结构，包含了节点及边信息
         self.embedding_dim = embedding_dim # dimension of S / T, dim(X)=1
         self.walk_length = walk_length - 1 # number of steps of walking
-        self.walks_per_node = walks_per_node
-        self.r_hop = r_hop
-        self.r_hop_size = r_hop_size
-        self.restart = restart
-        self.num_negative_samples = num_negative_samples
+        self.walks_per_node = walks_per_node # 每个节点的随机游走次数
+        self.r_hop = r_hop # 每次从r-hop邻居中采样的节点数
+        self.r_hop_size = r_hop_size # 生成r-hop邻居的跳数
+        self.restart = restart # 重启概率（用于DeepWalk的随机游走）
+        self.num_negative_samples = num_negative_samples # 每个正样本生成的负样本数量
 
+        # 初始化节点嵌入矩阵，embedding_dim*2+1是每个节点的嵌入向量的维度
         self.embedding = Embedding(graph.num_nodes, embedding_dim*2+1, sparse=sparse)
 
+        # 调用重置参数函数
         self.reset_parameters()
 
     def reset_parameters(self):
+        '''重置模型中的参数'''
         self.embedding.reset_parameters()
 
     def forward(self, batch=None):
@@ -393,6 +407,7 @@ class DeepWalkNeg(nn.Module):
         return emb if batch is None else emb.index_select(0, batch)
 
     def loader(self, **kwargs):
+        '''返回DataLoader实例，用于数据批处理'''
         return DataLoader(range(self.graph.num_nodes),
                           collate_fn=self.sample, **kwargs)
 
@@ -404,12 +419,13 @@ class DeepWalkNeg(nn.Module):
             restart: restart probability
             rand: used to randomly select the next node in a walk
         '''
-        path = [start]
-        for _ in range(walk_len):
-            cur = path[-1]
+        path = [start] # 起始节点
+        for _ in range(walk_len): # 游走长度
+            cur = path[-1] # # 当前节点
+            # 如果当前节点有邻居且不重启，则选择一个随机邻居
             if len(self.graph.get_children(cur)) > 0 and rand.random() >= restart:
                 path.append(rand.choice(self.graph.get_children(cur)))
-            else: # also restart if can't walk forward
+            else: # 如果无法继续游走，则重启
                 path.append(path[0])
         return path
 
@@ -420,40 +436,42 @@ class DeepWalkNeg(nn.Module):
         for _ in range(r_hop):
             curr_nodes = set()
             while len(queue) != 0:
-                curr_node = queue.popleft()
+                curr_node = queue.popleft() # 弹出队列中的当前节点
                 curr_nodes.update(child for child in self.graph.get_children(curr_node) if not(child in nodes_set))
             if len(curr_nodes) == 0:
                 break
             queue.extend(curr_nodes)
-            nodes_set |= curr_nodes
-        return list(nodes_set)
+            nodes_set |= curr_nodes # 合并节点集
+        return list(nodes_set) # r-hop邻居节点集合
 
     def pos_sample(self, batch):
-        ''' can rewrite to parallelism '''
-        batch = batch.repeat(self.walks_per_node)
-        r_hop_n = {}
+        ''' can rewrite to parallelism 生成正样本'''
+        batch = batch.repeat(self.walks_per_node) # 重复批次
+        r_hop_n = {} # 缓存r-hop邻居
         walks = []
         for b in batch:
-            s = b.item()
-            rw = self.random_walk(s, self.walk_length, restart=self.restart)
+            s = b.item() # 当前节点
+            rw = self.random_walk(s, self.walk_length, restart=self.restart) # 生成随机游走路径
             # sampling from r-hop context
             if s not in r_hop_n:
                 r_hop_n[s] = self.r_hop_neibors(s, self.r_hop)
-            rw.extend(random.choices(r_hop_n[s], k=self.r_hop_size))
+            rw.extend(random.choices(r_hop_n[s], k=self.r_hop_size)) # 从r-hop邻居中随机选择样本
 
             walks.append(rw)
         return torch.tensor(walks, dtype=torch.long)
 
     def neg_sample(self, batch):
+        '''生成负样本：随机选择节点并扩展游走路径'''
         batch = batch.repeat(self.walks_per_node * self.num_negative_samples)
-
+        # 随机生成负样本路径
         rw = torch.randint(self.graph.num_nodes,
                            (batch.size(0), self.walk_length+self.r_hop_size))
-        rw = torch.cat([batch.view(-1, 1), rw], dim=-1)
+        rw = torch.cat([batch.view(-1, 1), rw], dim=-1) # 将正样本和负样本路径合并
 
         return rw
 
     def sample(self, batch):
+        '''从批次中采样正样本和负样本'''
         if not isinstance(batch, torch.Tensor):
             batch = torch.tensor(batch)
         return self.pos_sample(batch), self.neg_sample(batch)
@@ -485,9 +503,10 @@ class DeepWalkNeg(nn.Module):
 
         neg_loss = -torch.log(1 - torch.sigmoid(out) + EPS).mean()
 
-        return pos_loss + neg_loss
+        return pos_loss + neg_loss # 总损失是正负样本损失的和
 
     def __repr__(self) -> str:
+        '''模型的字符串表示'''
         return (f'{self.__class__.__name__}({self.embedding.weight.size(0)}, '
                 f'{self.embedding.weight.size(1)})')
 
@@ -502,51 +521,72 @@ class S2V_DUEL(nn.Module):
         self.reg_hidden = reg_hidden
         self.len_pre_pooling = len_pre_pooling
         self.len_post_pooling = len_post_pooling
+
+        # 初始化mu_1（节点嵌入向量）和mu_2（线性变换层）
         self.mu_1 = torch.nn.Parameter(torch.Tensor(1, embed_dim))
         torch.nn.init.normal_(self.mu_1, mean=0, std=0.01)
         self.mu_2 = torch.nn.Linear(embed_dim, embed_dim, True)
         torch.nn.init.normal_(self.mu_2.weight, mean=0, std=0.01)
 
+        # 初始化预池化层
         self.list_pre_pooling = []
         for i in range(self.len_pre_pooling):
             pre_lin = torch.nn.Linear(embed_dim, embed_dim, bias=True)
             torch.nn.init.normal_(pre_lin.weight, mean=0, std=0.01)
             self.list_pre_pooling.append(pre_lin)
 
+        # 初始化后池化层
         self.list_post_pooling = []
         for i in range(self.len_post_pooling):
             post_lin =torch.nn.Linear(embed_dim, embed_dim, bias=True)
             torch.nn.init.normal_(post_lin.weight, mean=0, std=0.01)
             self.list_post_pooling.append(post_lin)
+
+        # 初始化Q网络的两层
         self.q_1 = torch.nn.Linear(embed_dim, embed_dim, bias=True)
         torch.nn.init.normal_(self.q_1.weight, mean=0, std=0.01)
         self.q_2 = torch.nn.Linear(embed_dim, embed_dim, bias=True)
         torch.nn.init.normal_(self.q_2.weight, mean=0, std=0.01)
 
+        # 如果使用隐藏层，则定义Q的回归网络和Dueling架构的层
         if self.reg_hidden > 0:
             self.q_reg = torch.nn.Linear(2 * embed_dim, self.reg_hidden)
             torch.nn.init.normal_(self.q_reg.weight, mean=0, std=0.01)
             # define dueling
+            # Dueling架构：价值网络（value）和优势网络（advantage）
             self.fc_value = torch.nn.Linear(self.reg_hidden, 4 * self.reg_hidden)
             self.fc_adv = torch.nn.Linear(self.reg_hidden, 4 * self.reg_hidden)
             self.value = torch.nn.Linear(4 * self.reg_hidden, 1)
             self.adv = torch.nn.Linear(4 * self.reg_hidden, 1)
         else:
             # define dueling
+            # 如果没有隐藏层，使用嵌入维度直接进行Dueling架构的定义
             self.fc_value = torch.nn.Linear(2 * embed_dim, 8 * embed_dim)
             self.fc_adv = torch.nn.Linear(2 * embed_dim, 8 * embed_dim)
             self.value = torch.nn.Linear(8 * embed_dim, 1)
             self.adv = torch.nn.Linear(8 * embed_dim, 1)
 
+        # 初始化Dueling网络的权重
         torch.nn.init.normal_(self.fc_value.weight, mean=0, std=0.01)
         torch.nn.init.normal_(self.fc_adv.weight, mean=0, std=0.01)
         torch.nn.init.normal_(self.value.weight, mean=0, std=0.01)
         torch.nn.init.normal_(self.adv.weight, mean=0, std=0.01)
 
     def forward(self, xv, adj):
-        # structure2vector
-        minibatch_size = xv.shape[0]
-        num_node = xv.shape[1]
+        '''
+        前向传播过程，计算节点的Q值
+
+        参数：
+        - xv: 输入的节点特征矩阵，形状为 (batch_size, num_nodes, embed_dim)
+        - adj: 图的邻接矩阵，表示节点之间的连接
+
+        返回：
+        - q: 每个节点的Q值
+        '''
+        # structure2vector部分
+        minibatch_size = xv.shape[0] # 获取批次大小
+        num_node = xv.shape[1] # 获取图中节点的数量
+        # 进行T次迭代的结构2向量过程
         for t in range(self.T):
             if t == 0:
                 mu = torch.matmul(xv, self.mu_1).clamp(0) # used as ReLU
@@ -566,17 +606,21 @@ class S2V_DUEL(nn.Module):
         q_2 = self.q_2(mu)
         q_ = torch.cat((q_1, q_2), dim=-1)
         if self.reg_hidden > 0:
+            # 如果使用隐藏层，先进行回归
             q_reg = self.q_reg(q_).clamp(0)
-            # insert dueling 
+            # insert dueling
+            # Dueling部分：计算价值（value）和优势（advantage）
             value = self.fc_value(torch.mean(q_reg, dim=1, keepdim=True)).clamp(0) # aggregate over all nodes embeddings
             adv = self.fc_adv(q_reg).clamp(0)
-
+            # 计算最终的价值和优势
             value = self.value(value)
             adv = self.adv(adv)
-
+            # 计算平均优势
             advAverage = torch.mean(adv, dim=1, keepdim=True) # aggregate advantage over all nodes
+            # Q值 = 价值 + 优势 - 平均优势
             q = value + adv - advAverage
         else:
+            # 如果没有使用隐藏层，直接计算Dueling部分
             q_= q_.clamp(0)
             # insert dueling
             value = self.fc_value(torch.mean(q_, dim=1, keepdim=True)).clamp(0)
@@ -584,8 +628,9 @@ class S2V_DUEL(nn.Module):
 
             value = self.value(value)
             adv = self.adv(adv)
-
+            # 计算平均优势
             advAverage = torch.mean(adv, dim=1, keepdim=True)
+            # 返回每个节点的Q值
             q = value + adv - advAverage
         return q
 

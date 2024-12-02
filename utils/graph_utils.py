@@ -13,21 +13,24 @@ np.random.seed(123)
 
 
 class Graph:
-    ''' graph class '''
+    ''' 图类，表示图结构，包含节点、边、子节点、父节点等信息 '''
     def __init__(self, nodes, edges, children, parents): 
-        self.nodes = nodes # set()
-        self.edges = edges # dict{(src,dst): weight, }
-        self.children = children # dict{node: set(), }
-        self.parents = parents # dict{node: set(), }
+        self.nodes = nodes # set()节点集合
+        self.edges = edges # dict{(src,dst): weight, }，存储每条边的权重
+        self.children = children # dict{node: set(), }，每个节点的子节点集合
+        self.parents = parents # dict{node: set(), }，每个节点的父节点集合
+
         # transfer children and parents to dict{node: list, }
         for node in self.children:
             self.children[node] = sorted(self.children[node])
         for node in self.parents:
             self.parents[node] = sorted(self.parents[node])
 
+        # 图的节点数和边数
         self.num_nodes = len(nodes)
         self.num_edges = len(edges)
 
+        # 用于缓存邻接矩阵和其他图的信息
         self._adj = None
         self._from_to_edges = None
         self._from_to_edges_weight = None
@@ -41,10 +44,11 @@ class Graph:
         return self.parents.get(node, [])
 
     def get_prob(self, edge):
+        ''' 返回某条边的概率（权重） '''
         return self.edges[edge]
 
     def get_adj(self):
-        ''' return scipy sparse matrix '''
+        ''' 返回图的邻接矩阵，使用稀疏矩阵存储 '''
         if self._adj is None:
             self._adj = np.zeros((self.num_nodes, self.num_nodes))
             for edge in self.edges:
@@ -53,21 +57,21 @@ class Graph:
         return self._adj
 
     def from_to_edges(self):
-        ''' return a list of edge of (src,dst) '''
+        ''' 返回所有的边列表 [(src, dst), ...] '''
         if self._from_to_edges is None:
             self._from_to_edges_weight = list(self.edges.items())
             self._from_to_edges = [p[0] for p in self._from_to_edges_weight]
         return self._from_to_edges
 
     def from_to_edges_weight(self):
-        ''' return a list of edge of (src, dst) with edge weight '''
+        ''' 返回带权重的边列表 [(src, dst, weight), ...] '''
         if self._from_to_edges_weight is None:
             self.from_to_edges()
         return self._from_to_edges_weight
 
 
 def read_graph(path, ind=0, directed=False):
-    ''' method to load edge as node pair graph '''
+    ''' 从文件读取图数据，并返回Graph对象 '''
     parents = {}
     children = {}
     edges = {}
@@ -79,50 +83,51 @@ def read_graph(path, ind=0, directed=False):
             if not len(line) or line.startswith('#') or line.startswith('%'):
                 continue
             row = line.split()
-            src = int(row[0]) - ind
+            src = int(row[0]) - ind # 将节点编号调整为从0开始
             dst = int(row[1]) - ind
             nodes.add(src)
             nodes.add(dst)
-            children.setdefault(src, set()).add(dst)
-            parents.setdefault(dst, set()).add(src)
-            edges[(src, dst)] = 0.0
-            if not(directed):
-                # regard as undirectional
-                children.setdefault(dst, set()).add(src)
-                parents.setdefault(src, set()).add(dst)
-                edges[(dst, src)] = 0.0
+            children.setdefault(src, set()).add(dst) # 添加子节点
+            parents.setdefault(dst, set()).add(src) # 添加父节点
+            edges[(src, dst)] = 0.0 # 初始化边的权重为0.0
 
-    # change the probability to 1/indegree
+            if not(directed): # 如果是无向图
+                # regard as undirectional
+                children.setdefault(dst, set()).add(src) # 添加反向子节点
+                parents.setdefault(src, set()).add(dst) # 添加反向父节点
+                edges[(dst, src)] = 0.0 # 初始化反向边的权重为0.0
+
+    # 设置边的权重为1/入度（即节点的父节点数）
     for src, dst in edges:
         edges[(src, dst)] = 1.0 / len(parents[dst])
             
     return Graph(nodes, edges, children, parents)
 
 def computeMC(graph, S, R):
-    ''' compute expected influence using MC under IC
-        R: number of trials
+    ''' 在IC传播模型的条件下使用MC方法计算影响力
+        R: 试验次数 每次计算的试验次数/使用的并行进程数
     '''
     sources = set(S)
-    inf = 0
+    inf = 0 # 期望影响力
     for _ in range(R):
-        source_set = sources.copy()
-        queue = deque(source_set)
+        source_set = sources.copy() # 初始种子集合
+        queue = deque(source_set) # 使用队列进行广度优先传播
         while True:
             curr_source_set = set()
             while len(queue) != 0:
-                curr_node = queue.popleft()
+                curr_node = queue.popleft() # 弹出当前节点
                 curr_source_set.update(child for child in graph.get_children(curr_node) \
                     if not(child in source_set) and random.random() <= graph.edges[(curr_node, child)])
             if len(curr_source_set) == 0:
                 break
             queue.extend(curr_source_set)
-            source_set |= curr_source_set
-        inf += len(source_set)
+            source_set |= curr_source_set # 更新源节点集合
+        inf += len(source_set) # 累加影响力
         
-    return inf / R
+    return inf / R # 返回平均影响力
 
 def workerMC(x):
-    ''' for multiprocessing '''
+    ''' 用于并行处理MC计算 '''
     return computeMC(x[0], x[1], x[2])
 
 def computeRR(graph, S, R, cache=None):
@@ -137,17 +142,17 @@ def computeRR(graph, S, R, cache=None):
     '''
     # generate RR set
     covered = 0
-    generate_RR = False
+    generate_RR = False # 是否生成新的RR集合
     if cache is not None:
         if len(cache) > 0:
             # might use break for efficiency for large seed set size or number of RR sets
             return sum(any(s in RR for s in S) for RR in cache) * 1.0 / R * graph.num_nodes
         else:
-            generate_RR = True
+            generate_RR = True # 如果缓存为空，则生成新的随机游走集合
 
     for i in range(R):
         # generate one set
-        source_set = {random.randint(0, graph.num_nodes - 1)}
+        source_set = {random.randint(0, graph.num_nodes - 1)} # 随机选择一个节点作为初始源节点
         queue = deque(source_set)
         while True:
             curr_source_set = set()
@@ -158,15 +163,15 @@ def computeRR(graph, S, R, cache=None):
             if len(curr_source_set) == 0:
                 break
             queue.extend(curr_source_set)
-            source_set |= curr_source_set
+            source_set |= curr_source_set # 更新源节点集合
         # compute covered(RR) / number(RR)
         for s in S:
             if s in source_set:
-                covered += 1
+                covered += 1 # 如果源节点集合中包含S中的元素，计算覆盖
                 break
         if generate_RR:
-            cache.append(source_set)
-    return covered * 1.0 / R * graph.num_nodes
+            cache.append(source_set) # 如果需要生成新的RR集合，保存生成的集合
+    return covered * 1.0 / R * graph.num_nodes # 返回期望影响力
 
 
 def workerRR(x):
@@ -181,7 +186,7 @@ def computeRR_inc(graph, S, R, cache=None, l_c=None):
             for any seed set
         cache: maybe already generated list of RR sets for the graph
         l_c: a list of RR set covered, to compute the incremental score
-            for environment step
+            for environment step用于计算增量分数
     '''
     # generate RR set
     covered = 0

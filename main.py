@@ -11,9 +11,9 @@ import environment
 import runner
 import logging
 
+# 设置随机种子，确保结果可复现
 torch.manual_seed(123)
 np.random.seed(123)
-
 
 # Set up logger
 logging.basicConfig(
@@ -55,12 +55,14 @@ def main():
     for i in range(len(path_graphs)):
         graph_lst[i].path_graph = path_graphs[i]
 
+    # 将加载的图赋值给args.graphs
     args.graphs = graph_lst
 
+    # 设置双重DQN为True
     args.double_dqn = True
 
-    if not args.test: # for training of tripling
-        time_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H:%M:%S')
+    if not args.test: # 如果不是测试模式，进行训练
+        time_stamp = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         if not os.path.exists(time_stamp):
             os.makedirs(time_stamp)
 
@@ -81,13 +83,13 @@ def main():
     ##### Load Environment #####
     # create environment
     logging.info('Loading environment %s' % args.environment_name)
-    train_env = environment.Environment(args.environment_name, graph_lst, args.budget, method='RR', use_cache=True)
-    test_env = environment.Environment(args.environment_name, graph_lst, args.budget, method='MC', use_cache=True)
+    train_env = environment.Environment(args.environment_name, graph_lst, args.budget, method='RR', use_cache=True) # 训练环境用RR
+    test_env = environment.Environment(args.environment_name, graph_lst, args.budget, method='MC', use_cache=True) # 测试环境用MC
     
     ##### Load Runner and Start Running #####
     print("Running a single instance simulation")
     my_runner = runner.Runner(train_env, test_env, agent, not(args.test))
-    if not(args.test):
+    if not(args.test): # 如果不是测试
         my_runner.train(args.epoch, args.model_file, 'list_cumul_reward.txt')
     else:
         my_runner.test(num_trials=10)
