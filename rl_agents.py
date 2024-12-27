@@ -1,14 +1,14 @@
 import random
-import time
 import os
 from collections import namedtuple, deque
 import numpy as np
 import models
 import torch
-import torch.nn.functional as F
 from torch_geometric.data import Data
 from torch_geometric.loader import DataLoader
 from torch_scatter import scatter_max
+
+from utils.bert_utils import GraphBertConfig, MethodWLNodeColoring, MethodGraphBatching, MethodHopDistance, loat_all_tag
 
 random.seed(123)
 torch.manual_seed(123)
@@ -47,8 +47,8 @@ class DQAgent:
                 T=self.T, w_scale=0.01, avg=False).to(self.device)
             # double dqn
             if self.training and self.double_dqn:
-                self.target = models.S2V_DUEL(reg_hidden=self.reg_hidden, embed_dim=self.embed_dim, node_dim=2, 
-                    edge_dim=4, T=self.T, w_scale=0.01, avg=False).to(self.device)
+                self.target = models.S2V_DUEL(reg_hidden=self.reg_hidden, embed_dim=self.embed_dim, node_dim=2, edge_dim=4,
+                T=self.T, w_scale=0.01, avg=False).to(self.device)
                 self.target.load_state_dict(self.model.state_dict())
                 self.target.eval()
             # graph input
@@ -78,6 +78,23 @@ class DQAgent:
             # graph input
             self.setup_graph_input = self.setup_graph_input_tripling
 
+        elif self.model_name == 'Bert_DQN':
+            residual_type = 'graph_raw'
+            k = 7
+            nfeature = 102
+            num_attention_heads = 2
+            num_hidden_layers = 2
+            hidden_size = intermediate_size = 32
+            bert_config = GraphBertConfig(residual_type=residual_type, k=k, x_size=nfeature,
+                                          hidden_size=hidden_size, intermediate_size=intermediate_size,
+                                          num_attention_heads=num_attention_heads, num_hidden_layers=num_hidden_layers)
+            self.model = models.Bert_DQN(bert_config, embed_dim=self.embed_dim, w_scale=0.01).to(self.device)
+            if self.training and self.double_dqn:
+                self.target = models.Bert_DQN(bert_config, embed_dim=self.embed_dim, w_scale=0.01).to(self.device)
+                self.target.load_state_dict(self.model.state_dict())
+                self.target.eval()
+            self.setup_graph_input = self.setup_graph_input_bert
+
         else:
             raise NotImplementedError(f'RL Model {self.model_name}')
 
@@ -88,7 +105,9 @@ class DQAgent:
         if not self.training:
             # load pretrained model for testing
             cwd = os.getcwd() # 获取当前工作目录
-            self.model.load_state_dict(torch.load(os.path.join(cwd, args.model_file)))
+            self.model.load_state_dict(torch.load(os.path.join(cwd, args.model_file),
+                                       map_location=torch.device(self.device),
+                                       weights_only=True))
             self.model.eval()
 
     def reset(self):
@@ -118,7 +137,7 @@ class DQAgent:
 
             data.append(Data(x=x, edge_index=edge_index, edge_attr=edge_attr, y=y))
 
-        loader = DataLoader(data, batch_size=sample_size, shuffle=False) # 创建数据加载器（迭代器）
+        loader = DataLoader(data, num_workers=0, batch_size=sample_size, shuffle=False) # 创建数据加载器（迭代器）
         for batch in loader:
             # adjust y if applicable
             if actions is not None:
@@ -151,10 +170,11 @@ class DQAgent:
                 edge_weight = torch.tensor([p[-1] for p in graphs[i].from_to_edges_weight()], dtype=torch.float)
 
                 y = actions[i].detach().clone() if actions is not None else None
+
                 data.append(Data(x=x, edge_index=edge_index, edge_weight=edge_weight, y=y))
 
         with torch.no_grad():
-            loader = DataLoader(data, pin_memory=True, num_workers=8, batch_size=sample_size, shuffle=False)
+            loader = DataLoader(data, pin_memory=True, num_workers=0, batch_size=sample_size, shuffle=False)
             for batch in loader:
                 # adjust y if applicable
                 if actions is not None:
@@ -164,6 +184,38 @@ class DQAgent:
                         batch[i].y += total_num # 将前面所有图的节点数加到当前图的目标 y 上 保证偏移
                 return batch.to(self.device)
 
+    def setup_graph_input_bert(self, graphs, states, actions=None):
+        sample_size = len(graphs)
+        data = []
+        for i in range(sample_size):
+            if id(graphs[i]) not in self.graph_node_embed:
+                self.graph_node_embed[id(graphs[i])] = models.get_init_node_embed(graphs[i], 30, self.device)
+            with torch.no_grad():
+                # copy node embedding as node feature
+                x = self.graph_node_embed[id(graphs[i])].detach().clone()
+                x = torch.cat((x, states[i].detach().clone().unsqueeze(dim=1)), dim=-1) # 沿着最后一个维度拼接 x:(node_size, 101(node_dim)) states:(sample_size, node_size)
+                idx = sorted(graphs[i].nodes)
+                node_color_dict = MethodWLNodeColoring(idx, np.array(graphs[i].from_to_edges())).run()
+                user_top_k_neighbor_intimacy_dict = MethodGraphBatching(graphs[i].get_S(), {i: j for i, j in enumerate(idx)}).run()
+                hop_dict = MethodHopDistance(idx, np.array(graphs[i].from_to_edges()), user_top_k_neighbor_intimacy_dict).run()
+                raw_embeddings, wl_embedding, hop_embeddings, int_embeddings = loat_all_tag(idx, x,
+                                                                                            node_color_dict,
+                                                                                            user_top_k_neighbor_intimacy_dict,
+                                                                                            hop_dict)
+                y = actions[i].detach().clone() if actions is not None else None
+                data.append(Data(x=x, y=y,
+                                 raw_embeddings=raw_embeddings, wl_embedding=wl_embedding,
+                                 hop_embeddings=hop_embeddings, int_embeddings=int_embeddings))
+        with torch.no_grad():
+            loader = DataLoader(data, pin_memory=True, num_workers=0, batch_size=sample_size, shuffle=False)
+            for batch in loader:
+                # adjust y if applicable
+                if actions is not None:
+                    total_num = 0
+                    for i in range(1, sample_size):
+                        total_num += batch[i - 1].num_nodes
+                        batch[i].y += total_num # 将前面所有图的节点数加到当前图的目标 y 上 保证偏移
+                return batch.to(self.device)
 
     @torch.no_grad()
     def setup_graph_pred(self, graphs, states, actions):

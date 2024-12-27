@@ -1,5 +1,4 @@
 import argparse
-import sys
 import os
 import time
 import datetime
@@ -22,17 +21,17 @@ logging.basicConfig(
 )
 
 parser = argparse.ArgumentParser(description='INF-GNN-RL')
-parser.add_argument('--budget', type=int, default=6, help='budget to select the source node set')
-parser.add_argument('--graph', type=str, metavar='GRAPH_PATH', default='soc-dolphins.txt', help='path to the graph file')
+parser.add_argument('--budget', type=int, default=5, help='budget to select the source node set')
+parser.add_argument('--graph', type=str, metavar='GRAPH_PATH', default='test_data/Wiki-2.txt', help='path to the graph file')
 parser.add_argument('--agent', type=str, metavar='AGENT_CLASS', default='Agent', help='class to use for the agent. Must be in the \'agent\' module.')
 parser.add_argument('--model', type=str, default='Tripling', help='model name')
 parser.add_argument('--model_file', type=str, default='tripling.ckpt', help='model file name')
-parser.add_argument('--epoch', type=int, metavar='nepoch', default=2000, help='number of epochs')
+parser.add_argument('--epoch', type=int, metavar='nepoch', default=20000, help='number of epochs')
 parser.add_argument('--lr', type=float, default=1e-3, help='learning rate')
-parser.add_argument('--bs', type=int, default=8, help='minibatch size for training')
-parser.add_argument('--n_step', type=int, default=2, help='n step transitions in RL')
+parser.add_argument('--bs', type=int, default=16, help='minibatch size for training')
+parser.add_argument('--n_step', type=int, default=1, help='n step transitions in RL')
 parser.add_argument('--cpu', action='store_true', default=False, help='use CPU')
-parser.add_argument('--test', action='store_true', default=False, help='test performance of model')
+parser.add_argument('--test', action='store_true', default=True, help='test performance of model')
 parser.add_argument('--environment_name', metavar='ENV_CLASS', type=str, default='IM', help='Class to use for the environment. Must be in the \'environment\' module')
 
 def main():
@@ -73,6 +72,12 @@ def main():
     args.reg_hidden = 32
     if args.model == 'Tripling':
         args.embed_dim = 50
+    elif args.model == 'S2V_DQN':
+        args.embed_dim = 64
+    elif args.model == 'S2V_DUEL':
+        args.embed_dim = 64
+    elif args.model == 'Bert_DQN':
+        args.embed_dim = 102
     else:
         args.embed_dim = 64
 
@@ -90,9 +95,9 @@ def main():
     print("Running a single instance simulation")
     my_runner = runner.Runner(train_env, test_env, agent, not(args.test))
     if not(args.test): # 如果不是测试
-        my_runner.train(args.epoch, args.model_file, 'list_cumul_reward.txt')
+        my_runner.train(args.epoch, args.model_file, 'list_cumul_train_reward.txt')
     else:
-        my_runner.test(num_trials=10)
+        my_runner.test('list_cumul_test_reward.txt', num_trials=10)
 
 if __name__ == "__main__":
     start_time = time.time()

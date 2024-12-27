@@ -6,10 +6,10 @@ import torch.nn.functional as F
 from torch_scatter import scatter_mean, scatter_add, scatter_softmax, scatter_max
 from torch.nn import Embedding
 from torch.utils.data import DataLoader
-from torch_geometric.utils.num_nodes import maybe_num_nodes
-import utils.graph_utils as graph_utils
 from collections import deque
-from tqdm import tqdm
+from transformers.models.bert.modeling_bert import BertPreTrainedModel
+
+from utils.bert_utils import MethodGraphBert
 
 random.seed(123)
 torch.manual_seed(123)
@@ -29,7 +29,7 @@ class S2V_DQN(nn.Module):
         self.reg_hidden = reg_hidden # 如果大于0表示有隐藏层
         self.avg = avg # 是否使用平均聚合方式
 
-        # input node to latent
+        # input node to latent 定义节点特征到潜在空间的映射权重
         self.w_n2l = torch.nn.Parameter(torch.Tensor(node_dim, embed_dim))
         torch.nn.init.normal_(self.w_n2l, mean=0, std=w_scale) # 使用正态分布初始化权重
 
@@ -117,10 +117,10 @@ class S2V_DQN(nn.Module):
         # can concatenate budget to global representation
         if data.y is not None: # Q func given a
             # 获取当前选择的节点的嵌入 (batch_size x embed_size)
-            action_embed = data.x[data.y]
+            action_embed = data.x[data.y] # 主要是y是如何用的 sample_size * 64
 
             # 拼接当前节点选择嵌入与全局图嵌入 (batch_size x (2 x embed_size))
-            embed_s_a = torch.cat((action_embed, y_potential), dim=-1) # ConcatCols
+            embed_s_a = torch.cat((action_embed, y_potential), dim=-1) # ConcatCols sample_size * 64 * 2
 
             last_output = embed_s_a
             if self.reg_hidden > 0:
@@ -130,7 +130,7 @@ class S2V_DQN(nn.Module):
             # batch_size x 1
             q_pred = torch.matmul(last_output, self.last_w)
 
-            return q_pred
+            return q_pred # sample_size * 1
 
         else: # Q func on all a
             rep_y = y_potential[data.batch]
@@ -143,7 +143,7 @@ class S2V_DQN(nn.Module):
 
             q_on_all = torch.matmul(last_output, self.last_w)
 
-            return q_on_all
+            return q_on_all # node_size * 1
 
 
 class Tripling(nn.Module):
@@ -311,7 +311,6 @@ class Tripling(nn.Module):
             # not active nodes
             not_selected = data.x[:, -1] == 0
             not_idx = torch.logical_and(not_y, not_selected)
-
             batch_idx = data.batch[not_idx]
             T_u = target_influ[not_idx]
 
@@ -352,7 +351,7 @@ def get_init_node_embed(graph, num_epochs, device):
         walks_per_node=50, num_negative_samples=5, restart=0.15, sparse=True).to(device)
 
     # 加载数据的迭代器，指定批量大小为 32，是否打乱数据为 True，使用 4 个工作线程
-    loader = model.loader(batch_size=32, shuffle=True, num_workers=4)
+    loader = model.loader(batch_size=32, shuffle=True, num_workers=0)
     optimizer = torch.optim.SparseAdam(list(model.parameters()), lr=0.01)
 
     def train():
@@ -513,40 +512,50 @@ class DeepWalkNeg(nn.Module):
 
 class S2V_DUEL(nn.Module):
     ''' structure2vector + dueling deep Q network '''
-    def __init__(self, reg_hidden, embed_dim, len_pre_pooling, len_post_pooling, T):
+
+    def __init__(self, reg_hidden, embed_dim, node_dim, edge_dim, T, w_scale, avg=False):
+        '''w_scale=0.01, node_dim=2, edge_dim=4'''
         super(S2V_DUEL, self).__init__()
         # depth of structure2vector
-        self.T = T
-        self.embed_dim = embed_dim
-        self.reg_hidden = reg_hidden
-        self.len_pre_pooling = len_pre_pooling
-        self.len_post_pooling = len_post_pooling
+        self.T = T  # 图嵌入迭代次数
+        self.embed_dim = embed_dim  # 嵌入空间的维度
+        self.reg_hidden = reg_hidden  # 如果大于0表示有隐藏层
+        self.avg = avg  # 是否使用平均聚合方式
 
-        # 初始化mu_1（节点嵌入向量）和mu_2（线性变换层）
-        self.mu_1 = torch.nn.Parameter(torch.Tensor(1, embed_dim))
-        torch.nn.init.normal_(self.mu_1, mean=0, std=0.01)
-        self.mu_2 = torch.nn.Linear(embed_dim, embed_dim, True)
-        torch.nn.init.normal_(self.mu_2.weight, mean=0, std=0.01)
+        # input node to latent 定义节点特征到潜在空间的映射权重
+        self.w_n2l = torch.nn.Parameter(torch.Tensor(node_dim, embed_dim))
+        torch.nn.init.normal_(self.w_n2l, mean=0, std=w_scale)  # 使用正态分布初始化权重
 
-        # 初始化预池化层
-        self.list_pre_pooling = []
-        for i in range(self.len_pre_pooling):
-            pre_lin = torch.nn.Linear(embed_dim, embed_dim, bias=True)
-            torch.nn.init.normal_(pre_lin.weight, mean=0, std=0.01)
-            self.list_pre_pooling.append(pre_lin)
+        # input edge to latent
+        self.w_e2l = torch.nn.Parameter(torch.Tensor(edge_dim, embed_dim))
+        torch.nn.init.normal_(self.w_e2l, mean=0, std=w_scale)  # 使用正态分布初始化权重
 
-        # 初始化后池化层
-        self.list_post_pooling = []
-        for i in range(self.len_post_pooling):
-            post_lin =torch.nn.Linear(embed_dim, embed_dim, bias=True)
-            torch.nn.init.normal_(post_lin.weight, mean=0, std=0.01)
-            self.list_post_pooling.append(post_lin)
+        # linear node conv
+        self.p_node_conv = torch.nn.Parameter(torch.Tensor(embed_dim, embed_dim))
+        torch.nn.init.normal_(self.p_node_conv, mean=0, std=w_scale)
 
-        # 初始化Q网络的两层
-        self.q_1 = torch.nn.Linear(embed_dim, embed_dim, bias=True)
-        torch.nn.init.normal_(self.q_1.weight, mean=0, std=0.01)
-        self.q_2 = torch.nn.Linear(embed_dim, embed_dim, bias=True)
-        torch.nn.init.normal_(self.q_2.weight, mean=0, std=0.01)
+        # trans node 1
+        self.trans_node_1 = torch.nn.Parameter(torch.Tensor(embed_dim, embed_dim))
+        torch.nn.init.normal_(self.trans_node_1, mean=0, std=w_scale)
+
+        # trans node 2
+        self.trans_node_2 = torch.nn.Parameter(torch.Tensor(embed_dim, embed_dim))
+        torch.nn.init.normal_(self.trans_node_2, mean=0, std=w_scale)
+
+        if self.reg_hidden > 0:
+            self.h1_weight = torch.nn.Parameter(torch.Tensor(2 * embed_dim, reg_hidden))
+            torch.nn.init.normal_(self.h1_weight, mean=0, std=w_scale)
+            self.h2_weight = torch.nn.Parameter(torch.Tensor(reg_hidden, 1))
+            torch.nn.init.normal_(self.h2_weight, mean=0, std=w_scale)
+            self.last_w = self.h2_weight
+        else:
+            # 如果没有隐藏层，直接将节点嵌入拼接并计算Q值
+            self.h1_weight = torch.nn.Parameter(torch.Tensor(2 * embed_dim, 1))
+            torch.nn.init.normal_(self.h1_weight, mean=0, std=w_scale)
+            self.last_w = self.h1_weight
+
+        # S2V scatter message passing 根据是否使用平均聚合来选择聚合函数
+        self.scatter_aggr = (scatter_mean if self.avg else scatter_add)
 
         # 如果使用隐藏层，则定义Q的回归网络和Dueling架构的层
         if self.reg_hidden > 0:
@@ -572,67 +581,114 @@ class S2V_DUEL(nn.Module):
         torch.nn.init.normal_(self.value.weight, mean=0, std=0.01)
         torch.nn.init.normal_(self.adv.weight, mean=0, std=0.01)
 
-    def forward(self, xv, adj):
-        '''
-        前向传播过程，计算节点的Q值
+    def forward(self, data):
+        data.x = torch.matmul(data.x, self.w_n2l)
+        data.x = F.relu(data.x)
+        # (batch_size x num_edge) x embed_size
+        # num_edge can vary for different graphs
+        data.edge_attr = torch.matmul(data.edge_attr, self.w_e2l)
 
-        参数：
-        - xv: 输入的节点特征矩阵，形状为 (batch_size, num_nodes, embed_dim)
-        - adj: 图的邻接矩阵，表示节点之间的连接
+        for _ in range(self.T):
+            # (batch_size x num_node) x embed_size
+            msg_linear = torch.matmul(data.x, self.p_node_conv)
+            # n2esum_param sparse matrix to aggregate node embed to edge embed
+            # (batch_size x num_edge) x embed_size
+            n2e_linear = msg_linear[data.edge_index[0]]
 
-        返回：
-        - q: 每个节点的Q值
-        '''
-        # structure2vector部分
-        minibatch_size = xv.shape[0] # 获取批次大小
-        num_node = xv.shape[1] # 获取图中节点的数量
-        # 进行T次迭代的结构2向量过程
-        for t in range(self.T):
-            if t == 0:
-                mu = torch.matmul(xv, self.mu_1).clamp(0) # used as ReLU
-            else:
-                mu_1 = torch.matmul(xv, self.mu_1).clamp(0)
-                # before pooling:
-                for i in range(self.len_pre_pooling):
-                    mu = self.list_pre_pooling[i](mu).clamp(0)
-                mu_pool = torch.matmul(adj, mu)
-                # after pooling
-                for i in range(self.len_post_pooling):
-                    mu_pool = self.list_post_pooling[i](mu_pool).clamp(0)
-                mu_2 = self.mu_2(mu_pool)
-                mu = torch.add(mu_1, mu_2).clamp(0)
-        # Q network
-        q_1 = self.q_1(torch.matmul(xv.transpose(1,2), mu)).expand(minibatch_size, num_node, self.embed_dim)
-        q_2 = self.q_2(mu)
-        q_ = torch.cat((q_1, q_2), dim=-1)
-        if self.reg_hidden > 0:
-            # 如果使用隐藏层，先进行回归
-            q_reg = self.q_reg(q_).clamp(0)
-            # insert dueling
-            # Dueling部分：计算价值（value）和优势（advantage）
-            value = self.fc_value(torch.mean(q_reg, dim=1, keepdim=True)).clamp(0) # aggregate over all nodes embeddings
-            adv = self.fc_adv(q_reg).clamp(0)
-            # 计算最终的价值和优势
-            value = self.value(value)
-            adv = self.adv(adv)
-            # 计算平均优势
-            advAverage = torch.mean(adv, dim=1, keepdim=True) # aggregate advantage over all nodes
-            # Q值 = 价值 + 优势 - 平均优势
-            q = value + adv - advAverage
+            # (batch_size x num_edge) x embed_size
+            edge_rep = torch.add(n2e_linear, data.edge_attr)
+            edge_rep = F.relu(edge_rep)
+
+            # e2nsum_param sparse matrix to aggregate edge embed to node embed
+            # (batch_size x num_node) x embed_size
+            e2n = self.scatter_aggr(edge_rep, data.edge_index[1], dim=0, dim_size=data.x.size(0))
+
+            # (batch_size x num_node) x embed_size
+            data.x = torch.add(torch.matmul(e2n, self.trans_node_1),
+                               torch.matmul(data.x, self.trans_node_2))
+            data.x = F.relu(data.x)
+
+        # subgsum_param sparse matrix to aggregate node embed to graph embed
+        # batch_size x embed_size
+        # torch_scatter can do broadcasting
+        y_potential = self.scatter_aggr(data.x, data.batch, dim=0)
+
+        if data.y is not None:
+            action_embed = data.x[data.y]  # 选择的节点的嵌入 (batch_size, 64)
+            # 拼接当前选择的节点的嵌入与全局图嵌入
+            embed_s_a = torch.cat((action_embed, y_potential), dim=-1)  # (batch_size, 128)
+            # 使用线性层 q_reg 映射到 reg_hidden 维度
+            hidden = embed_s_a
+            if self.reg_hidden > 0:
+                hidden = self.q_reg(embed_s_a)
+                hidden = F.relu(hidden)  # 激活函数
+
+            # Dueling Network: 价值网络（value）和优势网络（advantage）
+            value = self.fc_value(hidden)  # (batch_size, 128)
+            adv = self.fc_adv(hidden)  # (batch_size, 128)
+
+            # 输出的 Q 值分别是价值和优势的线性变换
+            value = self.value(value)  # (batch_size, 1)
+            adv = self.adv(adv)  # (batch_size, 1)
+
+            # 返回 Q 值：Q = value + (adv - mean(adv))
+            q_value = value + adv - adv.mean()
+            return q_value  # 返回计算的 Q 值
         else:
-            # 如果没有使用隐藏层，直接计算Dueling部分
-            q_= q_.clamp(0)
-            # insert dueling
-            value = self.fc_value(torch.mean(q_, dim=1, keepdim=True)).clamp(0)
-            adv = self.fc_adv(q_).clamp(0)
+            rep_y = y_potential[data.batch]
+            # 如果没有节点选择标签，则计算所有可能的 Q 值
+            embed_s_a_all = torch.cat((data.x, rep_y), dim=-1)  # (num_nodes, 256)
+            hidden_all = embed_s_a_all
+            if self.reg_hidden > 0:
+                hidden_all = self.q_reg(embed_s_a_all) # (num_nodes, reg_hidden)
+                hidden_all = F.relu(hidden_all)  # 激活函数
 
-            value = self.value(value)
-            adv = self.adv(adv)
-            # 计算平均优势
-            advAverage = torch.mean(adv, dim=1, keepdim=True)
-            # 返回每个节点的Q值
-            q = value + adv - advAverage
-        return q
+            value_all = self.fc_value(hidden_all)  # (num_nodes, 128)
+            adv_all = self.fc_adv(hidden_all)  # (num_nodes, 128)
 
+            value_all = self.value(value_all)  # (num_nodes, 1)
+            adv_all = self.adv(adv_all)  # (num_nodes, 1)
+
+            # 计算 Q 值
+            q_on_all = value_all + adv_all - adv_all.mean()  # (num_nodes, 1)
+
+            return q_on_all  # 返回计算的所有 Q
+
+class Bert_DQN(BertPreTrainedModel):
+    def __init__(self, config, embed_dim, w_scale):
+        super(Bert_DQN, self).__init__(config)
+        self.config = config
+        self.bert = MethodGraphBert(config)
+        self.cls_y = torch.nn.Linear(config.hidden_size, config.x_size)
+        self.init_weights()
+
+        self.h1_weight = torch.nn.Parameter(torch.Tensor(embed_dim, embed_dim))
+        torch.nn.init.normal_(self.h1_weight, mean=0, std=w_scale)
+        self.h2_weight = torch.nn.Parameter(torch.Tensor(embed_dim, 1))
+        torch.nn.init.normal_(self.h2_weight, mean=0, std=w_scale)
+
+    def forward(self, data):
+
+        outputs = self.bert(data.raw_embeddings, data.wl_embedding, data.int_embeddings, data.hop_embeddings)
+
+        sequence_output = 0
+        for i in range(self.config.k+1):
+            sequence_output += outputs[0][:,i,:]
+        sequence_output /= float(self.config.k+1)
+
+        x_hat = self.cls_y(sequence_output)
+
+        if data.y is not None:
+            action_embed = data.x[data.y]  # 选择的节点的嵌入 (batch_size, 64)
+            hidden = torch.matmul(action_embed, self.h1_weight)
+            last_output = F.relu(hidden)
+            q_pred = torch.matmul(last_output, self.h2_weight)
+            return q_pred  # 返回计算的 Q 值
+        else:
+            embed_s_a_all = torch.matmul(data.x, self.h1_weight)
+            hidden = torch.matmul(embed_s_a_all, self.h1_weight)
+            last_output = F.relu(hidden)
+            q_on_all = torch.matmul(last_output, self.h2_weight)
+            return q_on_all
 
 

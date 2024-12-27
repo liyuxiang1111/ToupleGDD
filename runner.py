@@ -89,7 +89,7 @@ class Runner:
                         for i in count():
                             state = torch.tensor(self.env.state, dtype=torch.long)
                             action = self.agent.select_action(self.env.graph, state, epsilon, training=training).item()
-
+                            # 如果每一次返回的动作一样执行后面的step会报错
                             final_reward, done = self.env.step(action, time_reward)
                             # this game is over
                             if done:
@@ -117,6 +117,8 @@ class Runner:
         # 开始训练过程
         tqdm.write('Starting fitting:') # 输出训练开始的提示信息
         progress_fitting = tqdm(total=num_epoch) # 创建一个进度条，表示训练的进度，最多 num_epoch 个周期
+        with open(result_file, 'wb') as log_file:
+            log_file.write(b'')
         for epoch in range(num_epoch):
             # 根据当前 epoch 计算 epsilon 的值，逐渐减少 epsilon，减少随机性
             eps = eps_end + max(0., (eps_start - eps_end) * (eps_step - epoch) / eps_step)
@@ -131,6 +133,8 @@ class Runner:
                 # 测试阶段：epsilon=0.0表示完全使用智能体当前的策略，不进行随机探索
                 rewards, seeds = self.play_game(1, 0.0, training=False) # 进行1局测试，记录奖励和随机种子
                 tqdm.write(f'{epoch}/{num_epoch}: ({str(seeds[0])[1:-1]}) | {rewards[0]}') # 输出测试结果
+                with open(result_file, mode="a") as log_file:
+                    log_file.write(f'{epoch}/{num_epoch}|({str(seeds[0])[1:-1]})|{rewards[0]}\n')
 
             # 每隔10个epoch，保存模型
             if epoch % 10 == 0:
@@ -151,14 +155,19 @@ class Runner:
         # 训练完成后，展示测试结果
         rewards, seeds = self.play_game(1, 0.0, training=False) # 进行一次测试，不再探索，使用最终的策略
         tqdm.write(f'{num_epoch}/{num_epoch}: ({str(seeds[0])[1:-1]}) | {rewards[0]}') # 输出最终的测试结果
+        with open(result_file, mode="a") as log_file:
+            log_file.write(f'{epoch}/{num_epoch}|({str(seeds[0])[1:-1]})|{rewards[0]}\n')
 
         self.agent.save_model(model_file)
 
 
-    def test(self, num_trials=1):
+    def test(self, result_file, num_trials=1):
         ''' let agent act in the environment
             num_trials: may need multiple trials to get average
         '''
+        with open(result_file, 'wb') as log_file:
+            log_file.write(b'')
+
         print('Generate seeds at one time:', flush=True)
         all_rewards, all_seeds = self.play_game(num_trials, 0.0, False, time_usage = True, one_time = True)
         print(f'Number of trials: {num_trials}')
@@ -166,7 +175,9 @@ class Runner:
         cnt = 0
         for a_r, a_s in zip(all_rewards, all_seeds):
             print(f'Seeds: {a_s} | Reward: {a_r}')
-
+            with open(result_file, mode="a") as log_file:
+                log_file.write('Generate seeds at one time:\n')
+                log_file.write(f'{cnt}|{a_s}|{a_r}\n')
             # 如果环境中有多个图，打印一个空行以分隔不同图的结果
             if len(self.env.graphs) > 1:
                 cnt += 1
@@ -181,8 +192,10 @@ class Runner:
         cnt = 0
         for a_r, a_s in zip(all_rewards, all_seeds):
             print(f'Seeds: {a_s} | Reward: {a_r}')
-
             # 如果环境中有多个图，打印一个空行以分隔不同图的结果
+            with open(result_file, mode="a") as log_file:
+                log_file.write('Generate seed one by one:\n')
+                log_file.write(f'{cnt}|{a_s}|{a_r}\n')
             if len(self.env.graphs) > 1:
                 cnt += 1
                 if cnt == len(self.env.graphs):

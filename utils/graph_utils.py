@@ -5,7 +5,9 @@ import math
 import statistics
 from collections import deque
 import numpy as np
-from scipy.sparse import csr_matrix
+from numpy.linalg import inv
+import scipy.sparse as sp
+from scipy.sparse import csr_matrix, coo_matrix
 from multiprocessing import Pool
 
 random.seed(123)
@@ -14,7 +16,9 @@ np.random.seed(123)
 
 class Graph:
     ''' 图类，表示图结构，包含节点、边、子节点、父节点等信息 '''
-    def __init__(self, nodes, edges, children, parents): 
+    def __init__(self, nodes, edges, children, parents):
+        self.c = 0.15
+
         self.nodes = nodes # set()节点集合
         self.edges = edges # dict{(src,dst): weight, }，存储每条边的权重
         self.children = children # dict{node: set(), }，每个节点的子节点集合
@@ -50,11 +54,24 @@ class Graph:
     def get_adj(self):
         ''' 返回图的邻接矩阵，使用稀疏矩阵存储 '''
         if self._adj is None:
-            self._adj = np.zeros((self.num_nodes, self.num_nodes))
+            self._adj = np.zeros((self.num_nodes, self.num_nodes)) # 创建矩阵
             for edge in self.edges:
                 self._adj[edge[0], edge[1]] = self.edges[edge] # may contain weight
             self._adj = csr_matrix(self._adj)
         return self._adj
+
+    # Structure
+    def get_S(self):
+        idx_map = {j: i for i, j in enumerate(self.nodes)}
+        edges = np.array(list(map(idx_map.get, np.array(self.from_to_edges()).flatten())),
+                         dtype=np.int64).reshape(np.array(self.from_to_edges()).shape)
+        adj = coo_matrix((np.ones(edges.shape[0]), (edges[:, 0], edges[:, 1])),
+                         shape=(self.num_nodes, self.num_nodes),
+                         dtype=np.float64)
+        adj = adj + adj.T.multiply(adj.T > adj) - adj.multiply(adj.T > adj)
+        eigen_adj = self.c * inv((sp.eye(adj.shape[0]) - (1 - self.c) * self.adj_normalize(adj)).toarray())
+        return eigen_adj
+
 
     def from_to_edges(self):
         ''' 返回所有的边列表 [(src, dst), ...] '''
@@ -69,26 +86,37 @@ class Graph:
             self.from_to_edges()
         return self._from_to_edges_weight
 
+    def adj_normalize(self, mx):
+        """Row-normalize sparse matrix"""
+        rowsum = np.array(mx.sum(1))
+        r_inv = np.power(rowsum, -0.5).flatten()
+        r_inv[np.isinf(r_inv)] = 0.
+        r_mat_inv = sp.diags(r_inv)
+        mx = r_mat_inv.dot(mx).dot(r_mat_inv)
+        return mx
+
 
 def read_graph(path, ind=0, directed=False):
     ''' 从文件读取图数据，并返回Graph对象 '''
-    parents = {}
-    children = {}
-    edges = {}
-    nodes = set()
+
+    # 初始化父节点、子节点、边和节点的集合
+    parents = {} # 用于存储每个节点的父节点集合
+    children = {} # 用于存储每个节点的子节点集合
+    edges = {} # 用于存储每条边及其权重
+    nodes = set() # 用于存储图中的所有节点
 
     with open(path, 'r') as f:
         for line in f:
-            line = line.strip()
+            line = line.strip() # 去除行两端的空白字符
             if not len(line) or line.startswith('#') or line.startswith('%'):
-                continue
-            row = line.split()
+                continue # 如果行为空或以注释符号（# 或 %）开头，则跳过该行
+            row = line.split() # 按空格分割行，获取节点信息
             src = int(row[0]) - ind # 将节点编号调整为从0开始
-            dst = int(row[1]) - ind
+            dst = int(row[1]) - ind # 目标节点编号
             nodes.add(src)
             nodes.add(dst)
-            children.setdefault(src, set()).add(dst) # 添加子节点
-            parents.setdefault(dst, set()).add(src) # 添加父节点
+            children.setdefault(src, set()).add(dst) # 将目标节点加入源节点的子节点集合中
+            parents.setdefault(dst, set()).add(src) # 将源节点加入目标节点的父节点集合中 将源节点添加到父节点中去
             edges[(src, dst)] = 0.0 # 初始化边的权重为0.0
 
             if not(directed): # 如果是无向图
@@ -105,22 +133,24 @@ def read_graph(path, ind=0, directed=False):
 
 def computeMC(graph, S, R):
     ''' 在IC传播模型的条件下使用MC方法计算影响力
+        graph: 图对象，包含节点、边、传播概率等信息
+        S: 种子节点集合（初始激活的节点）
         R: 试验次数 每次计算的试验次数/使用的并行进程数
     '''
-    sources = set(S)
-    inf = 0 # 期望影响力
-    for _ in range(R):
-        source_set = sources.copy() # 初始种子集合
-        queue = deque(source_set) # 使用队列进行广度优先传播
+    sources = set(S) # 将种子节点集合 S 转换为集合类型（去重）
+    inf = 0 # 初始化影响力为 0
+    for _ in range(R): # 进行 R 次蒙特卡罗试验
+        source_set = sources.copy() # 初始化源节点集合，复制种子节点集合
+        queue = deque(source_set) # 使用队列进行广度优先传播，初始化队列为源节点集合
         while True:
-            curr_source_set = set()
-            while len(queue) != 0:
-                curr_node = queue.popleft() # 弹出当前节点
+            curr_source_set = set() # 当前一轮传播后被激活的节点集合
+            while len(queue) != 0: # 遍历当前队列中的每一个节点，进行传播
+                curr_node = queue.popleft() # 从队列中弹出一个节点
                 curr_source_set.update(child for child in graph.get_children(curr_node) \
-                    if not(child in source_set) and random.random() <= graph.edges[(curr_node, child)])
-            if len(curr_source_set) == 0:
+                    if not(child in source_set) and random.random() <= graph.edges[(curr_node, child)]) # 遍历该节点的所有子节点，判断是否传播
+            if len(curr_source_set) == 0: # 如果当前一轮没有新的激活节点，结束传播
                 break
-            queue.extend(curr_source_set)
+            queue.extend(curr_source_set) # 更新队列
             source_set |= curr_source_set # 更新源节点集合
         inf += len(source_set) # 累加影响力
         
@@ -131,8 +161,8 @@ def workerMC(x):
     return computeMC(x[0], x[1], x[2])
 
 def computeRR(graph, S, R, cache=None):
-    ''' compute expected influence using RR under IC
-        R: number of trials
+    ''' 计算在IC模型下使用RR（Randomized Reachability）算法的预期影响力
+        R: 试验次数
         The generated RR sets are not saved; 
         We can save those RR sets, then we can use those RR sets
             for any seed set
@@ -141,35 +171,35 @@ def computeRR(graph, S, R, cache=None):
             for environment step
     '''
     # generate RR set
-    covered = 0
-    generate_RR = False # 是否生成新的RR集合
-    if cache is not None:
+    covered = 0 # 统计覆盖的节点数
+    generate_RR = False # 是否需要生成新的RR集合
+    if cache is not None: # 如果cache不为空，使用缓存中的RR集合
         if len(cache) > 0:
-            # might use break for efficiency for large seed set size or number of RR sets
+            # 如果cache已经存在数据，直接计算并返回结果
             return sum(any(s in RR for s in S) for RR in cache) * 1.0 / R * graph.num_nodes
         else:
             generate_RR = True # 如果缓存为空，则生成新的随机游走集合
 
-    for i in range(R):
+    for i in range(R): # R次反向集覆盖
         # generate one set
         source_set = {random.randint(0, graph.num_nodes - 1)} # 随机选择一个节点作为初始源节点
-        queue = deque(source_set)
-        while True:
-            curr_source_set = set()
-            while len(queue) != 0:
-                curr_node = queue.popleft()
+        queue = deque(source_set) # 使用队列来存储当前的源节点
+        while True: # 执行随机游走
+            curr_source_set = set() # 当前随机游走步骤的新覆盖的节点集合
+            while len(queue) != 0: # 遍历队列中的节点，扩展节点
+                curr_node = queue.popleft() # 从队列中取出第一个节点
                 curr_source_set.update(parent for parent in graph.get_parents(curr_node) \
-                    if not(parent in source_set) and random.random() <= graph.edges[(parent, curr_node)])
+                    if not(parent in source_set) and random.random() <= graph.edges[(parent, curr_node)]) # 扩展当前节点的父节点集，如果满足传播概率条件
             if len(curr_source_set) == 0:
                 break
-            queue.extend(curr_source_set)
-            source_set |= curr_source_set # 更新源节点集合
+            queue.extend(curr_source_set) # 将当前扩展的节点集合加入队列，继续传播
+            source_set |= curr_source_set # 更新源节点集合 并集
         # compute covered(RR) / number(RR)
-        for s in S:
+        for s in S: # S 表示的是action
             if s in source_set:
                 covered += 1 # 如果源节点集合中包含S中的元素，计算覆盖
-                break
-        if generate_RR:
+                break # 一旦S中的一个元素被覆盖，跳出循环
+        if generate_RR: # 如果需要生成新的RR集合，将当前生成的集合添加到缓存
             cache.append(source_set) # 如果需要生成新的RR集合，保存生成的集合
     return covered * 1.0 / R * graph.num_nodes # 返回期望影响力
 
